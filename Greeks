@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+Option Greeks Calculator & Visualiser – **v4.0**
+================================================
+*New in v4*
+-----------
+1. **Sign-aware single-Greek explanations** (Delta now distinguishes +1 vs –1).  
+2. **Combo-Greek insights** – after printing raw Greeks, the script runs a rule
+   engine (based on Hull, Taleb, Hull & White, CME primers) and prints up to
+   two qualitative “position profiles” using Delta ± Gamma, Vega ± Theta, and
+   Rho.  
+3. Prompts unchanged, pricing core unchanged, so existing automation still
+   works.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+import sys
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from typing import Callable
+
+# === prompt helpers ==========================================================
+
+def ask_float(prompt: str, default: float | None = None) -> float:
+    suffix = f" [{default}] " if default is not None else " "
+    while True:
+        raw = input(prompt + suffix).strip()
+        if raw == "":
+            if default is not None:
+                return default
+            print("  Please enter a number (use . for decimals).")
+            continue
+        try:
+            return float(raw.replace(",", ""))
+        except ValueError:
+            print("  Invalid number – try again.")
+
+def implied_vol(p: BSParams, market_price: float, 
+               low: float = 1e-6, high: float = 5.0, tol: float = 1e-6) -> float:
+    """Simple bisection on sigma to match bs_price(p) to market_price."""
+    def diff(sig: float) -> float:
+        p2 = BSParams(p.S, p.K, p.r, p.q, sig, p.T, p.call)
+        return bs_price(p2) - market_price
+
+    for _ in range(100):
+        mid = (low + high) / 2
+        if diff(mid) > 0:
+            high = mid
+        else:
+            low = mid
+        if high - low < tol:
+            break
+    return (low + high) / 2
+ 
+def ask_choice(prompt: str, choices: tuple[str, ...], default: str) -> str:
+    choices_str = "/".join(choices)
+    while True:
+        raw = input(f"{prompt} ({choices_str}) [{default}] ").strip().lower()
+        if raw == "":
+            return default
+        if raw in choices:
+            return raw
+        print(f"  Please choose one of {choices_str}.")
+
+# === Black-Scholes engine ====================================================
+
+@dataclass
+class BSParams:
+    S: float
+    K: float
+    r: float
+    q: float
+    sigma: float
+    T: float
+    call: bool
+
+
+def d1(p: BSParams) -> float:
+    return (math.log(p.S / p.K) + (p.r - p.q + 0.5 * p.sigma ** 2) * p.T) / (p.sigma * math.sqrt(p.T))
+
+
+def d2(p: BSParams) -> float:
+    return d1(p) - p.sigma * math.sqrt(p.T)
+
+# — pricing & Greeks ----------------------------------------------------------
+
+def bs_price(p: BSParams) -> float:
+    D1, D2 = d1(p), d2(p)
+    if p.call:
+        return math.exp(-p.q * p.T) * p.S * norm.cdf(D1) - math.exp(-p.r * p.T) * p.K * norm.cdf(D2)
+    return math.exp(-p.r * p.T) * p.K * norm.cdf(-D2) - math.exp(-p.q * p.T) * p.S * norm.cdf(-D1)
+
+
+def delta(p: BSParams) -> float:
+    D1 = d1(p)
+    fac = math.exp(-p.q * p.T)
+    return fac * norm.cdf(D1) if p.call else -fac * norm.cdf(-D1)
+
+
+def gamma(p: BSParams) -> float:
+    D1 = d1(p)
+    return math.exp(-p.q * p.T) * norm.pdf(D1) / (p.S * p.sigma * math.sqrt(p.T))
+
+
+def vega(p: BSParams) -> float:
+    D1 = d1(p)
+    return p.S * math.exp(-p.q * p.T) * norm.pdf(D1) * math.sqrt(p.T)
+
+
+def theta(p: BSParams) -> float:
+    D1, D2 = d1(p), d2(p)
+    term1 = -(p.S * math.exp(-p.q * p.T) * norm.pdf(D1) * p.sigma) / (2 * math.sqrt(p.T))
+    if p.call:
+        term2 = p.q * p.S * math.exp(-p.q * p.T) * norm.cdf(D1)
+        term3 = -p.r * p.K * math.exp(-p.r * p.T) * norm.cdf(D2)
+    else:
+        term2 = -p.q * p.S * math.exp(-p.q * p.T) * norm.cdf(-D1)
+        term3 = p.r * p.K * math.exp(-p.r * p.T) * norm.cdf(-D2)
+    return term1 + term2 + term3
+
+
+def rho(p: BSParams) -> float:
+    D2 = d2(p)
+    if p.call:
+        return p.K * p.T * math.exp(-p.r * p.T) * norm.cdf(D2)
+    return -p.K * p.T * math.exp(-p.r * p.T) * norm.cdf(-D2)
+
+
+def vomma(p: BSParams) -> float:
+    D1, D2 = d1(p), d2(p)
+    return vega(p) * D1 * D2 / p.sigma
+
+
+def vanna(p: BSParams) -> float:
+    D1 = d1(p)
+    return math.exp(-p.q * p.T) * norm.pdf(D1) * math.sqrt(p.T) * (1 - D1 / (p.sigma * math.sqrt(p.T)))
+
+# === interpretation logic ====================================================
+
+SINGLE = {
+    "delta": lambda d: (
+        "≈ +1 ⇒ behaves like **long** underlying (deep-ITM call)" if d > 0.9 else
+        "≈ –1 ⇒ behaves like **short** underlying (deep-ITM put)" if d < -0.9 else
+        "≈ ±0.5 ⇒ at-the-money; 1 € move in S → 0.5 € move in option" if 0.4 < abs(d) < 0.6 else
+        "Near 0 ⇒ far OTM; price barely moves with S"),
+    "gamma": lambda g: "High Γ (>0.02) ⇒ delta will change fast; hedge frequently" if g > 0.02 else "Low Γ ⇒ delta stable",
+    "vega":  lambda v: "High ν (>0.10) ⇒ option P/L very sensitive to vol shifts" if v > 0.10 else "Low ν ⇒ minimal vol risk",
+    "theta": lambda th: "Positive Θ ⇒ time decay **benefits** holder (rare)" if th > 0 else "Negative Θ ⇒ option loses value each day",
+    "rho":   lambda r: "Positive ρ ⇒ position gains if rates rise" if r > 0 else "Negative ρ ⇒ loses if rates rise",
+}
+
+COMBO_RULES = [
+    # now every rule takes (d, g, v, th, r)
+    (lambda d, g, v, th, r: abs(d) > 0.9 and g < 0.02,
+     "Δ ≈ ±1 & low Γ → Deep ITM; replicates underlying, hedge rarely."),
+    (lambda d, g, v, th, r: abs(d) < 0.1 and g > 0.02,
+     "Δ ≈ 0 but high Γ → Direction-neutral gamma trade; good for scalping large moves."),
+    (lambda d, g, v, th, r: abs(d) > 0.6 and g > 0.02,
+     "Large Δ & high Γ → Strong directional *and* convex; P/L accelerates if view is right."),
+    (lambda d, g, v, th, r: v > 0.10 and th < 0,
+     "High ν & negative Θ → Long-vol position (e.g., ATM straddle); paying carry for vol exposure."),
+    (lambda d, g, v, th, r: v < 0.05 and th > 0,
+     "Low ν & positive Θ → Carry-earning position (deep ITM put or covered-call)."),
+    (lambda d, g, v, th, r: abs(r) > 0.5,
+     "|ρ| large → Position dominated by interest-rate moves; consider hedging with fixed-income."),
+]
+# === main ====================================================================
+
+def main() -> None:
+    print("\nOption Greeks Calculator – provide inputs or hit Enter for defaults\n")
+
+    opt_type = ask_choice("Option type (call = right to BUY, put = right to SELL)", ("call", "put"), "call")
+    S = ask_float("Underlying price S (spot)", 100.0)
+    K = ask_float("Strike K (exercise price)", 100.0)
+    r = ask_float("Risk-free rate r (cont. comp.)", 0.02)
+    q = ask_float("Dividend yield q", 0.00)
+    # Capture time-to-expiry and call/put flag *before* any implied-vol logic
+    T = ask_float("Time to expiry T (years)", 0.5)
+    is_call = (opt_type == "call")
+    vol_input = ask_choice(
+         "Volatility input: explicit σ or implied vol", 
+         ("explicit", "implied"), 
+         "explicit",
+    )
+    if vol_input == "explicit":
+        sigma = ask_float("Volatility σ (0.10-1.00)", 0.25)
+    else:
+       # build a temporary params object with our known T and call flag
+        guess_p = BSParams(S, K, r, q, 0.25, T, is_call)
+        default_price = bs_price(guess_p)
+        mkt_price = ask_float("Market option price (€)", default_price)
+        temp = BSParams(S, K, r, q, 0.25, T, is_call)
+        sigma = implied_vol(temp, mkt_price)
+        print(f"  → Implied volatility solved: σ ≈ {sigma:.4f}")
+ 
+    p = BSParams(S, K, r, q, sigma, T, is_call)
+
+    price = bs_price(p)
+    raw = {
+        "delta": delta(p),
+        "gamma": gamma(p),
+        "vega": vega(p) / 100,    # per 1 vol-pt
+        "theta": theta(p) / 365,  # €/day
+        "rho": rho(p) / 100       # €/1 pc rate
+    }
+    raw["vomma"] = vomma(p) / 100
+    raw["vanna"] = vanna(p) / 100
+
+    # — print single-Greek interpretations -----------------------------------
+    print("\nBlack-Scholes price & Greeks")
+    print(f"Price : {price:,.4f} €")
+    for k,v in raw.items():
+        unit = {"delta":"", "gamma":" per €", "vega":" €/vol-pt", "theta":" €/day", "rho":" €/1 %", "vomma":" €/vol²", "vanna":" €/€/vol"}[k]
+        print(f"{k.capitalize():7}: {v:,.6f}{unit}")
+        if k in SINGLE:
+            print("  →", SINGLE[k](v))
+
+    # — combo engine ----------------------------------------------------------
+    print("\nCombo insights:")
+    printed = 0
+    for cond, msg in COMBO_RULES:
+        # now we pass exactly the five Greeks, in order
+        if cond(
+            raw["delta"],
+            raw["gamma"],
+            raw["vega"],
+            raw["theta"],
+            raw["rho"],
+        ):
+            print(" •", msg)
+            printed += 1
+        if printed == 2:
+            break
+    if printed == 0:
+        print(" • No standout pattern – position is fairly vanilla.")
+
+    # — plots same as before --------------------------------------------------
+    S_range = np.linspace(0.5*S, 1.5*S, 200)
+    price_curve = []
+    delta_curve = []
+    gamma_curve = []
+    for s_val in S_range:
+        tmp = BSParams(s_val, K, r, q, sigma, T, p.call)
+        price_curve.append(bs_price(tmp))
+        delta_curve.append(delta(tmp))
+        gamma_curve.append(gamma(tmp))
+
+    fig, ax = plt.subplots(3, 1, figsize=(6, 10), sharex=True)
+    ax[0].plot(S_range, price_curve)
+    ax[0].set_ylabel("Price (€)")
+    ax[0].set_title("Option price vs S")
+    ax[1].plot(S_range, delta_curve, color="tab:orange")
+    ax[1].set_ylabel("Delta")
+    ax[2].plot(S_range, gamma_curve, color="tab:green")
+    ax[2].set_ylabel("Gamma")
+    ax[2].set_xlabel("Underlying price S (€)")
+    fig.tight_layout()
+
+    T_axis = np.linspace(0.01, 2.0, 100)
+    vega_t, theta_t, rho_t = [], [], []
+    for t_val in T_axis:
+        tmp = BSParams(S, K, r, q, sigma, t_val, p.call)
+        vega_t.append(vega(tmp)/100)
+        theta_t.append(theta(tmp)/365)
+        rho_t.append(rho(tmp)/100)
+
+    plt.figure(figsize=(6,4))
+    plt.plot(T_axis, vega_t, label="Vega €/vol-pt")
+    plt.plot(T_axis, theta_t, label="Theta €/day")
+    plt.plot(T_axis, rho_t, label="Rho €/1 %")
+    plt.xlabel("Time to expiry (yrs)")
+    plt.legend()
+    plt.title("Vega, Theta, Rho vs time")
+    plt.tight_layout()
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\nCancelled by user.")
