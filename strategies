@@ -1,0 +1,296 @@
+"""
+Options Strategy Advisor – v7 (production ready)
+================================================
+* Leg-by-leg trade ticket
+* “Why this fits” explanation referencing your view
+* Optional auto‑implied‑volatility solver from an ATM option price
+* Same payoff chart, alternative strategy, and sensible defaults
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import List, Tuple
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# -------------------------------------------------------------------
+# Descriptive text for each strategy
+# -------------------------------------------------------------------
+
+STRAT_INFO: dict[str, str] = {
+    "Long Call": "Buy one OTM call for leveraged upside with limited risk.",
+    "Long Put": "Buy one OTM put for downside protection or speculation.",
+    "Bull Call Spread": "Debit vertical: long call + short higher‑strike call (same expiry). Cheaper, defined risk.",
+    "Bear Put Spread": "Debit vertical: long put + short lower‑strike put. Defined‑risk bearish.",
+    "Bull Put Spread": "Credit vertical: short higher‑strike put + long lower‑strike put. Income with limited downside.",
+    "Bear Call Spread": "Credit vertical: short lower‑strike call + long higher‑strike call. Income if stock stays below short strike.",
+    "Iron Condor": "Short OTM put spread + short OTM call spread. Collect premium if price stays in range.",
+    "Long Straddle": "Buy ATM call and put — long volatility play when unsure of direction.",
+    "Short Strangle": "Sell OTM call and put. Collect premium betting on muted moves.",
+    "Cash‑Secured Put": "Sell OTM put with cash reserved to buy shares if assigned (paid limit order).",
+}
+
+# -------------------------------------------------------------------
+# Black‑Scholes helpers
+# -------------------------------------------------------------------
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def bs_price(S: float, K: float, T: float, r: float, sigma: float, opt_type: str) -> float:
+    if T <= 0:
+        return max(0.0, (S - K) if opt_type == "C" else (K - S))
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if opt_type == "C":
+        return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+    return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+# Implied vol via bisection
+
+def implied_vol(price: float, S: float, K: float, T: float, r: float, opt_type: str, tol: float = 1e-4) -> float:
+    low, high = 1e-6, 5.0
+    for _ in range(100):
+        mid = 0.5 * (low + high)
+        val = bs_price(S, K, T, r, mid, opt_type)
+        if abs(val - price) < tol:
+            return mid
+        if val > price:
+            high = mid
+        else:
+            low = mid
+    return mid
+
+# -------------------------------------------------------------------
+# Data classes
+# -------------------------------------------------------------------
+
+@dataclass
+class Leg:
+    qty: int
+    opt_type: str  # "C" or "P"
+    strike: float
+    premium: float
+
+    def payoff(self, S: np.ndarray) -> np.ndarray:
+        intrinsic = np.where(
+            self.opt_type == "C",
+            np.maximum(S - self.strike, 0.0),
+            np.maximum(self.strike - S, 0.0),
+        )
+        return self.qty * (intrinsic - self.premium)
+
+@dataclass
+class Strategy:
+    name: str
+    legs: List[Leg]
+
+    def payoff(self, S: np.ndarray) -> np.ndarray:
+        return sum((leg.payoff(S) for leg in self.legs))
+
+    @property
+    def net_premium(self) -> float:
+        return sum(l.qty * l.premium for l in self.legs)
+
+    def max_profit_loss(self, S: np.ndarray) -> Tuple[float, float]:
+        pl = self.payoff(S)
+        return float(np.max(pl)), float(np.min(pl))
+
+# -------------------------------------------------------------------
+# Strategy builder
+# -------------------------------------------------------------------
+
+def build_strategy(name: str, S0: float, iv: float, T: float, r: float) -> Strategy:
+    C = lambda K: bs_price(S0, K, T, r, iv, "C")
+    P = lambda K: bs_price(S0, K, T, r, iv, "P")
+
+    if name == "Long Call":
+        K = round(S0 * 1.05, 2)
+        return Strategy(name, [Leg(+1, "C", K, C(K))])
+
+    if name == "Long Put":
+        K = round(S0 * 0.95, 2)
+        return Strategy(name, [Leg(+1, "P", K, P(K))])
+
+    if name == "Bull Call Spread":
+        K1, K2 = round(S0, 2), round(S0 * 1.10, 2)
+        return Strategy(name, [Leg(+1, "C", K1, C(K1)), Leg(-1, "C", K2, C(K2))])
+
+    if name == "Bear Put Spread":
+        K1, K2 = round(S0, 2), round(S0 * 0.90, 2)
+        return Strategy(name, [Leg(+1, "P", K1, P(K1)), Leg(-1, "P", K2, P(K2))])
+
+    if name == "Bull Put Spread":
+        K1, K2 = round(S0 * 1.05, 2), round(S0 * 0.95, 2)
+        return Strategy(name, [Leg(-1, "P", K1, P(K1)), Leg(+1, "P", K2, P(K2))])
+
+    if name == "Bear Call Spread":
+        K1, K2 = round(S0 * 0.95, 2), round(S0 * 1.05, 2)
+        return Strategy(name, [Leg(-1, "C", K1, C(K1)), Leg(+1, "C", K2, C(K2))])
+
+    if name == "Iron Condor":
+        Kp1, Kp2 = round(S0 * 0.90, 2), round(S0 * 0.95, 2)
+        Kc2, Kc1 = round(S0 * 1.05, 2), round(S0 * 1.10, 2)
+        legs = [
+            Leg(+1, "P", Kp1, P(Kp1)),
+            Leg(-1, "P", Kp2, P(Kp2)),
+            Leg(-1, "C", Kc2, C(Kc2)),
+            Leg(+1, "C", Kc1, C(Kc1)),
+        ]
+        return Strategy(name, legs)
+
+    if name == "Long Straddle":
+        K = round(S0, 2)
+        return Strategy(name, [Leg(+1, "C", K, C(K)), Leg(+1, "P", K, P(K))])
+
+    if name == "Short Strangle":
+        Kp, Kc = round(S0 * 0.95, 2), round(S0 * 1.05, 2)
+        return Strategy(name, [Leg(-1, "P", Kp, P(Kp)), Leg(-1, "C", Kc, C(Kc))])
+
+    if name == "Cash‑Secured Put":
+        K = round(S0 * 0.95, 2)
+        return Strategy(name, [Leg(-1, "P", K, P(K))])
+
+    raise ValueError("Unknown strategy")
+
+# -------------------------------------------------------------------
+# Recommendation engine
+# -------------------------------------------------------------------
+
+def recommend(direction: str, vol_view: str, risk: str) -> Tuple[str, str]:
+    if direction == "bullish":
+        if risk == "defined":
+            return ("Bull Call Spread", "Long Call") if vol_view == "low" else ("Long Call", "Bull Call Spread")
+        return "Bull Put Spread", "Cash‑Secured Put"
+    if direction == "bearish":
+        if risk == "defined":
+            return ("Bear Put Spread", "Long Put") if vol_view == "low" else ("Long Put", "Bear Put Spread")
+        
+        # willing to short premium
+        return "Bear Call Spread", "Short Strangle"
+    # neutral bias
+    return ("Iron Condor", "Short Strangle") if vol_view == "high" else ("Long Straddle", "Iron Condor")
+
+
+# -------------------------------------------------------------------
+# Helper I/O utilities
+# -------------------------------------------------------------------
+def menu(question: str, options: List[str]) -> str:
+    print(f"\n{question}")
+    for i, opt in enumerate(options, 1):
+        print(f"  {i}. {opt}{' (default)' if i == 1 else ''}")
+    default = options[0]
+    while True:
+        ans = input("Select > ").strip()
+        if ans == "":
+            return default
+        if ans.isdigit() and 1 <= int(ans) <= len(options):
+            return options[int(ans) - 1]
+        for opt in options:
+            if ans.lower() == opt.lower():
+                return opt
+        print("→ Invalid selection; try again.")
+
+
+def ask_float(prompt: str, default: float) -> float:
+    while True:
+        txt = input(prompt).strip()
+        if txt == "":
+            return default
+        try:
+            return float(txt)
+        except ValueError:
+            print("→ Numeric value required.")
+
+
+def print_trade_ticket(strat: Strategy) -> None:
+    print("\nTrade ticket:")
+    for leg in strat.legs:
+        side = "BUY " if leg.qty > 0 else "SELL"
+        typ = "CALL" if leg.opt_type == "C" else "PUT "
+        print(f"  {side}{abs(leg.qty):>2}  {typ}  Strike={leg.strike:<8}  Premium={leg.premium:.2f}")
+
+
+def reason_text(direction: str, vol_view: str, risk: str, name: str) -> str:
+    pieces = [
+        f"You are **{direction}** with **{vol_view} volatility** expectations and",
+        f"prefer **{risk} risk**. Therefore, **{name}** matches your outlook."
+    ]
+    return " ".join(pieces)
+
+
+# -------------------------------------------------------------------
+# Main driver
+# -------------------------------------------------------------------
+def main() -> None:
+    print("\n=== OPTIONS STRATEGY ADVISOR v7 ===")
+
+    direction = menu("Price forecast?", ["bullish", "bearish", "neutral"])
+    vol_view = menu("Volatility outlook?", ["high", "low", "sideways"])
+    risk_pref = menu("Risk preference?", ["defined", "willing short premium"])
+
+    S0 = ask_float("Underlying spot price [100]: ", 100.0)
+
+    # Implied-vol input or back-solve
+    raw_iv = input("Implied volatility % (blank = derive from ATM option price): ").strip()
+    if raw_iv:
+        iv = float(raw_iv) / 100.0
+        days = int(ask_float("Days to expiration [30]: ", 30.0))
+        r = ask_float("Risk-free rate % [2]: ", 2.0) / 100.0
+    else:
+        opt_type = menu("ATM option for IV calc:", ["call", "put"])
+        price = ask_float("Market price of that option: ", 5.0)
+        days = int(ask_float("Days to same expiry [30]: ", 30.0))
+        r = ask_float("Risk-free rate % [2]: ", 2.0) / 100.0
+        T_tmp = days / 365.0
+        K_atm = round(S0, 2)
+        iv = implied_vol(price, S0, K_atm, T_tmp, r, "C" if opt_type == "call" else "P")
+        print(f"→ Implied volatility solved at {iv*100:.2f}%")
+
+    T = days / 365.0
+
+    prim_name, alt_name = recommend(direction, vol_view, risk_pref)
+    strat = build_strategy(prim_name, S0, iv, T, r)
+    alt   = build_strategy(alt_name, S0, iv, T, r)
+
+    # --- Output ---
+    print("\n" + reason_text(direction, vol_view, risk_pref, prim_name))
+    print("\nRecommended strategy:", prim_name)
+    print_trade_ticket(strat)
+    max_p, min_l = strat.max_profit_loss(np.linspace(0.5*S0, 1.5*S0, 301))
+    print(f"  Net premium : {strat.net_premium:+.2f}")
+    print(f"  Max profit  : {max_p:+.2f}")
+    print(f"  Max loss    : {min_l:+.2f}")
+    print("  What it is  :", STRAT_INFO.get(prim_name, 'N/A'))
+
+    print("\nAlternative strategy:", alt_name)
+    print_trade_ticket(alt)
+    max_p2, min_l2 = alt.max_profit_loss(np.linspace(0.5*S0, 1.5*S0, 301))
+    print(f"  Net premium : {alt.net_premium:+.2f}")
+    print(f"  Max profit  : {max_p2:+.2f}")
+    print(f"  Max loss    : {min_l2:+.2f}")
+    print("  What it is  :", STRAT_INFO.get(alt_name, 'N/A'))
+
+    # --- Payoff chart ---
+    grid = np.linspace(0.5*S0, 1.5*S0, 301)
+    plt.figure(figsize=(9, 5))
+    plt.plot(grid, strat.payoff(grid), label=prim_name)
+    plt.plot(grid, alt.payoff(grid), linestyle="--", label=f"{alt_name} (alt)")
+    plt.axhline(0, color="black", linewidth=0.7)
+    plt.title("Profit / Loss at Expiration")
+    plt.xlabel("Underlying Price at Expiry")
+    plt.ylabel("P / L per Share")
+    plt.grid(True, linestyle=":")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAborted by user.")
